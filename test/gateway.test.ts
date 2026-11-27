@@ -23,6 +23,75 @@ test('falls back when primary fails', async () => {
   assert.deepEqual(store.jobs.map((j) => j.status), ['failed', 'done']);
 });
 
+// Fails with the given HTTP status on the first `failures` calls, then succeeds.
+const flaky = (name: string, status: number, failures = 1) => {
+  let calls = 0;
+  return {
+    name, model: 'm', calls: () => calls,
+    run: async () => {
+      calls++;
+      if (calls <= failures) throw Object.assign(new Error(`HTTP ${status}`), { status });
+      return { output: { ok: name }, costUsd: 0.04 };
+    },
+  };
+};
+
+test('retries a transient error on the same provider before falling back', async () => {
+  const store = new MemoryJobStore();
+  const g = new Gateway({ store });
+  const a = flaky('a', 503);
+  const b = ok('b');
+  g.register('draft', { ...a, retries: 1, backoffMs: 1 }, b);
+  const r = await g.run('draft', {}, { userId: 'u1' });
+  assert.equal(r.provider, 'a');
+  assert.equal(a.calls(), 2);
+  assert.deepEqual(store.jobs.map((j) => [j.provider, j.status]), [['a', 'failed'], ['a', 'done']]);
+});
+
+test('retries 429 and falls back once retries are used up', async () => {
+  const store = new MemoryJobStore();
+  const g = new Gateway({ store });
+  const a = flaky('a', 429, 5);
+  g.register('draft', { ...a, retries: 2, backoffMs: 1 }, ok('b'));
+  const r = await g.run('draft', {}, { userId: 'u1' });
+  assert.equal(r.provider, 'b');
+  assert.equal(a.calls(), 3);
+  assert.deepEqual(store.jobs.map((j) => j.status), ['failed', 'failed', 'failed', 'done']);
+});
+
+test('does not retry a non-transient error', async () => {
+  const g = new Gateway();
+  const a = flaky('a', 400);
+  g.register('draft', { ...a, retries: 3, backoffMs: 1 }, ok('b'));
+  const r = await g.run('draft', {}, { userId: 'u1' });
+  assert.equal(r.provider, 'b');
+  assert.equal(a.calls(), 1);
+});
+
+test('no retries by default', async () => {
+  const g = new Gateway();
+  const a = flaky('a', 503);
+  g.register('draft', a, ok('b'));
+  assert.equal((await g.run('draft', {}, { userId: 'u1' })).provider, 'b');
+  assert.equal(a.calls(), 1);
+});
+
+test('waits backoffMs before retrying, doubling each time', async () => {
+  const g = new Gateway();
+  const a = flaky('a', 500, 2);
+  g.register('draft', { ...a, retries: 2, backoffMs: 20 });
+  const started = Date.now();
+  await g.run('draft', {}, { userId: 'u1' });
+  assert.ok(Date.now() - started >= 55, 'expected about 20ms + 40ms of backoff');
+});
+
+test('image edit provider error carries the HTTP status', async () => {
+  const storage = { read: async () => new Blob([new Uint8Array([1])]), write: async () => {} };
+  const fakeFetch = (async () => new Response('slow down', { status: 429 })) as typeof fetch;
+  const p = imageEditProvider({ apiKey: 'test', storage, fetchImpl: fakeFetch });
+  await assert.rejects(p.run({ sourcePath: 'src/a.png', prompt: 'x' }), { status: 429 });
+});
+
 test('stops at the daily limit', async () => {
   const g = new Gateway({ dailyLimitUsd: 0.05 });
   g.register('draft', ok('a', 0.05));

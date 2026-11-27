@@ -25,7 +25,7 @@ export function imageEditProvider(opts: {
       form.append('prompt', String(input.prompt));
       for (const p of paths) form.append('image[]', await opts.storage.read(p), p.split('/').pop() || 'image.png');
       const r = await f(`${base}/images/edits`, { method: 'POST', headers: { Authorization: `Bearer ${opts.apiKey}` }, body: form });
-      if (!r.ok) throw new Error(`Image API ${r.status}: ${(await r.text()).slice(0, 300)}`);
+      if (!r.ok) throw Object.assign(new Error(`Image API ${r.status}: ${(await r.text()).slice(0, 300)}`), { status: r.status });
       const j = (await r.json()) as { data?: { b64_json?: string }[] };
       const b64 = j.data?.[0]?.b64_json;
       if (!b64) throw new Error('Image API returned no image');

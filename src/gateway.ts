@@ -5,7 +5,19 @@ export type Provider = {
   name: string;
   model: string;
   run: (input: Record<string, unknown>) => Promise<{ output: Record<string, unknown>; costUsd: number }>;
+  /** Extra attempts on a transient error (429, 5xx, or an error with no HTTP status) before falling back. Default 0. */
+  retries?: number;
+  /** Wait before the first retry, doubled on each further retry. Default 0. */
+  backoffMs?: number;
 };
+
+/** Errors with a numeric `status` are retried only for 429 and 5xx; errors without one (e.g. network) are retried. */
+function isTransient(e: unknown) {
+  const status = (e as { status?: unknown } | null)?.status;
+  return typeof status !== 'number' || status === 429 || status >= 500;
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export type Job = {
   id: string; task: string; userId: string; projectId?: string; provider: string; model: string;
@@ -56,16 +68,21 @@ export class Gateway {
     if (!chain.length) throw new Error(`No model configured for ${task}`);
     let lastErr = '';
     for (const p of chain) {
-      const id = crypto.randomUUID();
-      const started = Date.now();
-      await this.store.create({ id, task, ...who, provider: p.name, model: p.model, status: 'running', input, costUsd: 0, createdAt: new Date() });
-      try {
-        const { output, costUsd } = await p.run(input);
-        await this.store.update(id, { status: 'done', output, costUsd, durationMs: Date.now() - started });
-        return { jobId: id, provider: p.name, output, costUsd };
-      } catch (e) {
-        lastErr = e instanceof Error ? e.message : String(e);
-        await this.store.update(id, { status: 'failed', error: lastErr, durationMs: Date.now() - started });
+      const retries = Math.max(0, Math.floor(p.retries ?? 0));
+      for (let attempt = 0; attempt <= retries; attempt++) {
+        if (attempt > 0) await sleep((p.backoffMs ?? 0) * 2 ** (attempt - 1));
+        const id = crypto.randomUUID();
+        const started = Date.now();
+        await this.store.create({ id, task, ...who, provider: p.name, model: p.model, status: 'running', input, costUsd: 0, createdAt: new Date() });
+        try {
+          const { output, costUsd } = await p.run(input);
+          await this.store.update(id, { status: 'done', output, costUsd, durationMs: Date.now() - started });
+          return { jobId: id, provider: p.name, output, costUsd };
+        } catch (e) {
+          lastErr = e instanceof Error ? e.message : String(e);
+          await this.store.update(id, { status: 'failed', error: lastErr, durationMs: Date.now() - started });
+          if (!isTransient(e)) break;
+        }
       }
     }
     throw new Error(`All models failed: ${lastErr}`);
